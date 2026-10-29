@@ -1,5 +1,5 @@
 # Analisa 8 Repo NUT-ARNAJAKDEV + Manual Erytra Eflexis + Rekomendasi Stack
-## Kebutuhan: baca file hasil mesin Erytra Eflexis di folder Windows → kirim ke database
+## Kebutuhan: baca file hasil mesin Erytra Eflexis di folder Windows → kirim ke service Prima (HTTP POST)
 
 Organisasi GitHub: [NUT-ARNAJAKDEV](https://github.com/NUT-ARNAJAKDEV) · Tanggal analisa: 29 Oktober 2026
 
@@ -22,6 +22,8 @@ Sumber:
 > 1. File `.DAT` adalah **ASTM E1394**, bukan log bebas.
 > 2. Diana Server menulis `TX_TMP.dat` lalu **rename ke `OUT.dat`** → rename itu sendiri adalah penanda "file selesai".
 > 3. **`OUT.dat` wajib dihapus oleh sisi LIS**; kalau tidak, mesin memunculkan error setelah timeout. Ini membalik prioritas desain: hapus cepat, proses belakangan.
+>
+> **Dikonfirmasi dari lapangan:** nama file tetap **`OUT.dat`**; path folder dan nilai timeout **dinamis lewat config**; tujuan pengiriman bukan database, melainkan **service Prima lewat HTTP POST**. Nama file yang tetap itu memunculkan race condition saat menghapus — solusinya di 2.10; konsekuensi target HTTP ada di bagian 7.
 
 ---
 
@@ -31,10 +33,12 @@ Sumber:
 |---|---|
 | "membaca sebuah file di folder tertentu di Windows" | File watcher + parser format file mesin |
 | "ketika data itu ada" | Deteksi file baru **dan** deteksi file sudah selesai ditulis |
-| "dikirim ke database untuk melakukan update data" | Delivery yang idempotent + retry, bukan INSERT buta |
+| "dikirim ke service Prima dengan method POST" | HTTP client yang idempotent + retry terklasifikasi, bukan POST buta |
 | (implisit) jalan terus tanpa diawasi | Windows Service, auto-start, auto-restart, ada log |
 
 Empat hal ini yang menentukan pilihan stack. Bukan bahasa pemrogramannya.
+
+Satu catatan penting soal "tidak pakai DB": itu berarti **tidak ada database tujuan** — bukan berarti tanpa penyimpanan lokal sama sekali. Antrean lokal (SQLite) tetap wajib, karena tanpa itu kegagalan jaringan Prima = data hilang. Bedanya, SQLite di sini bukan tujuan data, hanya **penyangga** yang boleh dihapus kapan saja setelah semua terkirim.
 
 ---
 
@@ -120,7 +124,9 @@ Isi: 1 file Go 100 baris. Baca `ref.log` sebagai CSV → POST JSON ke `jsonplace
 Yang layak diambil: pola `http.Client{Timeout: 10 * time.Second}`, `csv.Reader`, header `Content-Type`/`Accept`.
 Yang kurang: tidak ada retry, tidak ada idempotency, `log.Fatalf` di semua error (proses mati, data di memori hilang), `ioutil` sudah deprecated sejak Go 1.16.
 
-**Skor: 25 %** (kerangka, bukan solusi).
+Karena target akhirnya memang **service HTTP Prima**, repo ini naik relevansinya: kerangka `net/http` + timeout di sini bisa dipakai langsung, asalkan tiga hal ditambahkan — klasifikasi status (4xx vs 5xx), `Idempotency-Key`, dan retry berjenjang.
+
+**Skor: 35 %** (kerangka pengirim; naik dari 25 % setelah target dipastikan HTTP POST).
 
 ---
 
@@ -344,11 +350,29 @@ Software ini menyertakan **Host Demo** — program yang **mensimulasikan LIS**, 
 
 Artinya: **tool Anda bisa diuji tanpa mesin dan tanpa LIS asli.** Konfigurasi Host Demo harus sama dengan konfigurasi Diana Server, barcode sampel harus sama dengan yang di alat, dan nama tes harus sama dengan profil `.gru` yang aktif (lihat `DSC.def` / `DSC_Custom.def`). Ini menghapus alasan "belum bisa dites karena mesinnya sedang dipakai".
 
-#### Yang tidak dijawab manual ini
+#### Yang manual tidak sebutkan — dan jawabannya dari lapangan
 
-- **Path folder bersama** tidak disebutkan (diisi di Diana Server, bukan nilai default) — harus ditanyakan ke lapangan.
-- **Nilai timeout** tidak menyebut angka — harus dilihat di layar konfigurasi Diana Server.
-- Apakah produksi memakai `OUT.dat` atau `OUT_<timestamp>.DAT`.
+| Pertanyaan | Jawaban | Konsekuensi desain |
+|---|---|---|
+| Path folder bersama | **Dinamis, dari config** | Tidak ada path yang di-hardcode; agent membaca `inbox_dir` dari config dan bisa dipindah tanpa rebuild |
+| Nilai timeout | **Dinamis, dari config** | Simpan `delete_deadline` sebagai parameter; dipakai untuk alarm kesehatan, bukan untuk menunda hapus |
+| `OUT.dat` atau `OUT_<timestamp>.DAT`? | **`OUT.dat`** (nama tetap) | Watcher mencocokkan nama persis; `OUT_<timestamp>.DAT` hanya artefak ekspor manual, bukan alur produksi |
+
+Karena nama filenya **tetap** `OUT.dat`, ada dua konsekuensi teknis yang tidak muncul kalau namanya unik per transaksi:
+
+**1. Jangan pernah memakai pola `*.dat`.** `TX_TMP.dat` ada di folder yang sama dan isinya setengah jadi. Pola `*.dat` — yang dipakai `Move-file-automation` dan `Copy-file-automation` — akan menyalin file setengah jadi. Cocokkan nama persis `OUT.dat` (di Windows bandingkan case-insensitive).
+
+**2. Ada race condition saat menghapus.** Urutannya bisa begini: Anda menyalin `OUT.dat` → Diana selesai menulis transaksi baru dan me-rename `TX_TMP.dat` menjadi `OUT.dat` (menimpa) → Anda menghapus `OUT.dat` → **transaksi baru hilang tanpa jejak**.
+
+Tiga cara menanganinya, berurutan dari yang paling aman:
+
+| Cara | Mekanisme | Catatan |
+|---|---|---|
+| **Rename-to-claim** (disarankan) | `OUT.dat` → `OUT.<timestamp>.<rand>.dat` di folder yang sama, lalu baca file hasil rename | Satu operasi metadata yang atomik. File yang diklaim pasti file yang tadi terlihat — race hilang sepenuhnya. Sekaligus memenuhi kewajiban "hapus" dari sudut pandang Diana |
+| Verifikasi sebelum hapus | Bandingkan `size`+`mtime`+hash file di path dengan yang baru disalin; hapus hanya kalau identik | Aman, tapi ada jendela waktu antara cek dan hapus |
+| Copy lalu hapus langsung | Paling sederhana | Hanya boleh kalau volume transaksi sangat rendah dan tidak ada pengiriman beruntun |
+
+Untuk file 15 KB di share LAN, rename-to-claim selesai dalam hitungan milidetik — jauh di bawah timeout apa pun.
 
 ---
 
@@ -358,7 +382,7 @@ Artinya: **tool Anda bisa diuji tanpa mesin dan tanpa LIS asli.** Konfigurasi Ho
 |---|---|---|---|---|
 | [IOT-Gateway](https://github.com/NUT-ARNAJAKDEV/IOT-Gateway) | VBS/Go/Py/Bat | Log mesin → API Odoo | **85 %** | Arsitektur, pemetaan field, kontrak payload |
 | [AOI300R_VISION](https://github.com/NUT-ARNAJAKDEV/AOI300R_VISION) | Python | Mesin → MySQL | 40 % | Skema tabel, guard validasi |
-| [API-ref-logfile](https://github.com/NUT-ARNAJAKDEV/API-ref-logfile) | Go | File → HTTP POST | 25 % | Kerangka HTTP client |
+| [API-ref-logfile](https://github.com/NUT-ARNAJAKDEV/API-ref-logfile) | Go | File → HTTP POST | 35 % | Kerangka HTTP client (target akhirnya memang HTTP) |
 | [verify-27-fill](https://github.com/NUT-ARNAJAKDEV/verify-27-fill) | Go | Validasi jumlah baris | 20 % | Konsep gate (bukan cara hapus) |
 | [Move-file-automation](https://github.com/NUT-ARNAJAKDEV/Move-file-automation) | Batch | Pindah file | 20 % | Pola klaim/arsip |
 | [DE1-Stock-GO-Backend](https://github.com/NUT-ARNAJAKDEV/DE1-Stock-GO-Backend) | Go | REST + MySQL | 15 % | Referensi Gin + sqlx |
@@ -376,16 +400,17 @@ Dan nilai terbesar dari seluruh bahan yang dianalisa justru ada di **manual konf
 
 ---
 
-## 4. Delapan aturan yang wajib ada di tool baru
+## 4. Sembilan aturan yang wajib ada di tool baru
 
-1. **Kelengkapan file dibuktikan mesin, bukan ditebak.** Mode file sharing: Diana Server menulis `TX_TMP.dat` lalu **rename** ke `OUT.dat` — rename atomik, jadi `OUT.dat` yang muncul sudah utuh. Lapis kedua: record `L|1|N`; lapis ketiga: ukuran + mtime diam 2–3 detik. **Jangan pernah memantau `*.dat`** — `TX_TMP.dat` juga `.dat` dan isinya setengah jadi.
-2. **Hapus `OUT.dat` secepat mungkin — itu kewajiban protokol, bukan kerapian.** Manual (hal. 99): kalau LIS tidak menghapus dalam timeout, mesin memunculkan error. Urutan yang benar: **salin → hapus `OUT.dat` → baru parse & kirim**. Kegagalan DB tidak boleh menahan file di folder bersama.
-3. **Idempotency per hasil, bukan per file.** Satu file ASTM berisi puluhan hasil. Kunci alaminya `(patient_id, test_code, requested_at)` dengan `UNIQUE`; hash file hanya untuk mencegah file yang sama diproses dua kali di tingkat berkas.
-4. **Outbox lokal.** Tulis payload ke SQLite dulu, baru kirim. DB/API mati → data tetap aman dan terkirim saat pulih. Ini pengganti `standby.log` yang rapuh.
-5. **Arsipkan salinan Anda sendiri, bukan file mesin.** `inbox/` → `processing/` → `archive/YYYY-MM-DD/`. Gagal parse → `error/` + alasan di log.
-6. **Validasi eksplisit, bukan positional.** Setiap field punya nama dan tipe; komponen hasil ditafsirkan **berdasarkan nama template** (`ABO2D.pln`, `3 Screen(AHG).pln`), bukan indeks tetap.
-7. **Jangan hardcode waktu, path, encoding, kredensial.** Timezone dari config, path dari config, encoding UTF-8/ANSI dari config (Diana Server mendukung keduanya, hal. 107).
-8. **Observable.** Log JSON terstruktur, `/healthz`, jumlah antrean, file terakhir diproses, error terakhir, dan **waktu hapus `OUT.dat`** (untuk memantau apakah masih di bawah timeout).
+1. **Kelengkapan file dibuktikan mesin, bukan ditebak.** Mode file sharing: Diana Server menulis `TX_TMP.dat` lalu **rename** ke `OUT.dat` — rename atomik, jadi `OUT.dat` yang muncul sudah utuh. Lapis kedua: record `L|1|N`. Lapis ketiga: ukuran + mtime diam 2–3 detik. **Cocokkan nama persis `OUT.dat`; jangan pernah memantau `*.dat`** — `TX_TMP.dat` ada di folder yang sama dan isinya setengah jadi.
+2. **Klaim file dengan rename, jangan copy-lalu-hapus.** Karena nama `OUT.dat` dipakai ulang, hapus tanpa klaim bisa menghapus transaksi baru yang datang di tengah proses. `OUT.dat` → `OUT.<ts>.<rand>.dat` (rename atomik) = klaim + hapus dalam satu operasi, sekaligus memenuhi kewajiban protokol.
+3. **Hapus dari folder bersama secepat mungkin — itu kewajiban, bukan kerapian.** Manual (hal. 99): kalau LIS tidak menghapus dalam timeout, mesin memunculkan error. Jalur ini tidak boleh menyentuh jaringan Prima sama sekali.
+4. **Idempotency per hasil, bukan per file.** Satu file ASTM berisi puluhan hasil. Kunci alaminya `(patient_id, test_code, requested_at)`. Kirim sebagai **`Idempotency-Key`** (atau field kunci di body) supaya Prima bisa menolak duplikat; di sisi kita, kunci yang sama disimpan `UNIQUE` di SQLite.
+5. **Outbox lokal, dan bedakan 4xx dari 5xx.** Tulis payload ke SQLite dulu, baru kirim. **5xx / timeout / jaringan → retry dengan backoff. 4xx → jangan diulang**, pindahkan ke `failed_permanent` + notifikasi. Mengulang `400 Bad Request` selamanya adalah bug paling umum di integrator seperti ini.
+6. **Arsipkan salinan Anda sendiri, bukan file mesin.** `spool/` → `archive/YYYY-MM-DD/`. Gagal parse → `error/` + alasan di log. Karena tidak ada DB tujuan, arsip inilah satu-satunya bukti mentah yang Anda punya.
+7. **Validasi eksplisit, bukan positional.** Setiap field punya nama dan tipe; komponen hasil ditafsirkan **berdasarkan nama template** (`ABO2D.pln`, `3 Screen(AHG).pln`), bukan indeks tetap.
+8. **Semua yang berubah di lapangan masuk config, bukan kode.** Path folder, deadline hapus, encoding (UTF-8/ANSI), URL & token Prima. Tanpa rebuild.
+9. **Observable.** Log JSON terstruktur, `/healthz`, jumlah antrean, file terakhir diproses, error terakhir, dan **lama waktu dari deteksi sampai `OUT.dat` hilang** — metrik yang langsung menunjukkan apakah Anda masih di bawah timeout mesin.
 
 ---
 
@@ -397,115 +422,126 @@ Dan nilai terbesar dari seluruh bahan yang dianalisa justru ada di **manual konf
 |---|---|---|
 | Watcher | `fsnotify` + polling cadangan 30 detik | Event tidak reliable di share jaringan/mapped drive — polling menyelamatkan |
 | Parser | **ASTM E1394** (tulis sendiri, ~150 baris) + registry template | Format baku: split `\|` lalu `^`. Arti komponen dari nama template `.pln`, bukan indeks tetap |
-| Gate kestabilan | record `L\|1\|N` + cek `size`/`mtime` 2× + buka eksklusif | Solusi masalah #1 di atas, dengan bukti dari mesin sendiri |
-| Encoding | `golang.org/x/text/encoding` (charmap/unicode) | Ganti `Windows-1252` hardcoded |
-| Outbox | `modernc.org/sqlite` (pure Go, tanpa CGO) | Tanpa compiler C, binary tetap satu file |
-| Database | `jackc/pgx` (Postgres) atau `go-sql-driver/mysql` (MySQL) | UPSERT: `ON CONFLICT DO UPDATE` / `ON DUPLICATE KEY UPDATE` |
+| Klaim file | `os.Rename` (atomik) + fallback copy–verifikasi–hapus | Satu operasi mengklaim sekaligus mengosongkan folder bersama |
+| Encoding | `golang.org/x/text/encoding` (charmap/unicode) | UTF-8 default, ANSI/Windows-1252 sebagai opsi |
+| Outbox | `modernc.org/sqlite` (pure Go, tanpa CGO) | Antrean + state pengiriman; binary tetap satu file |
+| **Pengiriman** | `net/http` standar + `Idempotency-Key` | Cukup; tidak perlu SDK. Timeout eksplisit, retry terklasifikasi |
 | Service | `kardianos/service` | Install/uninstall service Windows, auto-restart saat crash |
 | Config | YAML + override env | Ganti `*.config` satu-baris |
 | Log | `log/slog` JSON + `lumberjack` | Rotasi otomatis, mudah di-parse |
-| Admin/health | `gin` (sudah Anda kuasai dari DE1) | `/healthz`, `/api/ingest-log`, retry manual |
+| Admin/health | `gin` (sudah Anda kuasai dari DE1) | `/healthz`, `/api/ingest-log`, tombol retry manual |
 
 **Kenapa Go, bukan yang lain, untuk kasus ini:**
 
 - **Satu `.exe`, tanpa runtime.** Di PC lantai produksi, tidak perlu install Python/Node/.NET. Tidak ada masalah PyInstaller vs antivirus.
 - **Service Windows kelas satu.** `kardianos/service` → auto-start sebelum login, restart otomatis.
-- **Sudah terbukti di tangan Anda.** 4 dari 8 repo ini Go; `update.go` sudah melakukan POST JSON-RPC dengan benar.
+- **Sudah terbukti di tangan Anda.** 4 dari 8 repo ini Go; `update.go` sudah melakukan POST JSON-RPC dengan benar — termasuk header token.
 - **Parser ASTM tidak butuh ekosistem berat.** Ini file ekspor, bukan framing serial — 150 baris Go cukup, tanpa dependensi tambahan.
 - **RAM ~15 MB** vs ~120 MB untuk Python+watchdog — penting kalau tool jalan 24/7 di PC yang sama dengan software mesin.
 
 ### Alternatif A: **Python 3.12 + watchdog**
-`watchdog` + `pydantic` (validasi skema) + `SQLAlchemy` + `tenacity` (retry) + `structlog`; paket via PyInstaller, service via NSSM.
+`watchdog` + `pydantic` (validasi skema) + `sqlite3`/`SQLAlchemy` + `httpx` + `tenacity` (retry) + `structlog`; paket via PyInstaller, service via NSSM.
 Pilih ini kalau: parsing file-nya berantakan (butuh `pandas`), atau Anda lebih cepat menulis Python. `AOI300R_VISION` membuktikan Anda nyaman di sini. Kelemahan: distribusi dan service lebih ribet, konsumsi RAM lebih besar.
 
 ### Alternatif B: **.NET 8 Worker Service**
-`FileSystemWatcher` bawaan + `BackgroundService` + Dapper + Polly + Serilog; MSI installer.
+`FileSystemWatcher` bawaan + `BackgroundService` + `HttpClientFactory` + Polly + Serilog; MSI installer.
 Pilih ini kalau: butuh GUI konfigurasi (WPF) menyatu dengan service, atau lingkungannya mewajibkan stack Microsoft. Kelemahan: belum ada bukti C# di repo Anda.
 
-### Database
-- **Postgres** kalau boleh pilih bebas: `jsonb` untuk payload mentah, `ON CONFLICT` bersih, partisi tabel per bulan.
-- **MySQL** kalau mengikuti infra yang ada (AOI memakai MySQL): aman, `INSERT … ON DUPLICATE KEY UPDATE` cukup.
-- **Odoo** kalau tujuannya memang Odoo (seperti IOT-Gateway): jangan INSERT langsung ke tabel Odoo — pakai XML-RPC/JSON-RPC dengan **external ID** sebagai kunci idempotency.
+### Kontrak HTTP ke Prima
+
+Karena targetnya service, bukan database, yang menentukan kualitas integrasi bukan skema tabel melainkan **kontrak HTTP**. Minimum yang harus disepakati dengan tim Prima:
+
+| Aspek | Yang perlu dipastikan |
+|---|---|
+| Endpoint | URL per hasil, atau satu URL batch untuk satu file? |
+| Auth | Token di header (seperti `update.go`: header `token`) / Bearer / API key? |
+| Bentuk body | Satu objek hasil, atau `{ "data": [ ... ] }` berisi 57 hasil? |
+| **Idempotency** | Apakah Prima menerima `Idempotency-Key`? Kalau tidak, apakah mereka menolak duplikat berdasarkan `patient_id + test_code + requested_at`? |
+| Respons sukses | `200` / `201`? Ada body balasan berisi ID? |
+| Respons duplikat | `409` (anggap sukses) atau `200`? |
+| Respons validasi | `400`/`422` dengan detail field? |
+| Timeout server | Berapa lama Prima memproses sebelum klien menyerah? |
+
+Kalau kontrak ini belum ada, usulkan yang paling aman: **satu POST per hasil** dengan `Idempotency-Key`, `200/201` = sukses, `409` = sudah ada (perlakukan sukses), `4xx` lain = permanen, `5xx`/timeout = retry. Mengirim 57 hasil dalam satu batch memang lebih efisien, tapi kalau satu item ditolak, seluruh batch gagal dan Anda harus memilah ulang — per hasil lebih mudah dioperasikan.
 
 ---
 
 ## 6. Arsitektur yang direkomendasikan
 
 ```
-[Diana Server] tulis TX_TMP.dat → rename → OUT.dat   (folder bersama, unik)
-                                            ↓  (watcher: nama persis "OUT.dat")
-                                  salin isi ke spool lokal
+[Folder bersama]  ← path dari config (bisa share jaringan)
+   Diana: tulis TX_TMP.dat → rename → OUT.dat
+                                            ↓  watcher: nama persis "OUT.dat"
+                          rename  OUT.dat → OUT.<ts>.<rand>.dat   ← KLAIM (atomik)
+                                            │   folder bersama langsung bersih
                                             ↓
-                              HAPUS OUT.dat  ← dalam hitungan detik,
-                                            │   sebelum timeout mesin
+                            baca file hasil klaim → tulis ke spool lokal
                                             ↓
                             parse ASTM E1394 → N hasil (H/Q/P/O/R/L)
                              ↓ gagal            ↓ valid
-                     C:\Erytra\error\      outbox SQLite (N payload + status)
-                     (+ alasan di log)          ↓
-                                        sender: retry backoff 1s→5m
+                          error\ + alasan   outbox SQLite (N payload + status)
                                                 ↓
-                            DB: UPSERT per hasil
-                            (kunci: patient_id + test_code + requested_at)
-                                                ↓ sukses
-                                    C:\Erytra\archive\YYYY-MM-DD\
+                            sender: POST ke Prima, retry backoff 1s→5m
+                            (4xx = berhenti, 5xx/timeout = ulangi)
+                                                ↓ 2xx / 409
+                                    archive\YYYY-MM-DD\
 ```
 
 Dua jalur dengan prioritas berbeda, dan itu disengaja:
 
-- **Jalur cepat (milidetik–detik):** salin + hapus `OUT.dat`. Tidak menyentuh database sama sekali, jadi tidak bisa gagal karena DB.
-- **Jalur lambat (bisa menit):** parse + validasi + kirim + retry. Boleh gagal berkali-kali tanpa mengganggu mesin.
+- **Jalur cepat (milidetik):** satu operasi `rename` mengklaim sekaligus mengosongkan folder bersama. Tidak menyentuh jaringan Prima, tidak menyalin byte lewat jaringan dua kali.
+- **Jalur lambat (bisa menit):** baca → parse → validasi → POST → retry. Boleh gagal berkali-kali tanpa mengganggu mesin.
 
 Inilah pembeda utama dengan IOT-Gateway, yang menghapus `OUT.dat` hanya setelah HTTP 200 — sehingga gangguan API langsung berubah menjadi error di layar mesin.
 
+Kalau `rename` ditolak (ACL share hanya mengizinkan hapus, bukan rename), pakai fallback: salin → verifikasi hash → hapus. Jangan pernah `copy` lalu `move` terpisah tanpa verifikasi.
+
 ---
 
-## 7. Skema database minimum
+## 7. State lokal (SQLite) — bukan database tujuan
+
+Tidak ada database di sisi Anda. Yang tetap ada adalah **antrean + jejak pengiriman** di SQLite lokal, supaya kegagalan Prima tidak menghilangkan data dan supaya tidak ada hasil terkirim dua kali.
 
 ```sql
--- level berkas: mencegah file yang sama diproses dua kali
-CREATE TABLE ingest_log (
-  id            BIGSERIAL PRIMARY KEY,
-  file_name     TEXT        NOT NULL,
-  file_hash     CHAR(64)    NOT NULL,        -- sha256 isi file
-  file_size     BIGINT      NOT NULL,
-  record_count  INT         NOT NULL,        -- jumlah record R di dalamnya
-  received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  status        TEXT        NOT NULL,        -- pending|sent|failed
-  attempts      INT         NOT NULL DEFAULT 0,
+-- satu baris per file yang diklaim dari folder bersama
+CREATE TABLE ingest_file (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_name     TEXT    NOT NULL,            -- OUT.<ts>.<rand>.dat (hasil klaim)
+  file_hash     TEXT    NOT NULL,            -- sha256 isi file
+  file_size     INTEGER NOT NULL,
+  record_count  INTEGER NOT NULL,            -- jumlah record R
+  received_at   TEXT    NOT NULL,            -- RFC3339
+  status        TEXT    NOT NULL,            -- parsed|parse_failed
   last_error    TEXT,
   UNIQUE (file_hash)
 );
 
--- level hasil: bentuknya mengikuti ASTM E1394 (satu file = banyak baris)
-CREATE TABLE astm_result (
-  id             BIGSERIAL PRIMARY KEY,
-  patient_id     TEXT        NOT NULL,       -- P-3, MRN pasien
-  test_code      TEXT        NOT NULL,       -- abo.gru, DGW11E.gru, …
-  template       TEXT,                       -- ABO2D.pln, 3 Screen(AHG).pln
-  requested_at   TIMESTAMPTZ NOT NULL,       -- O-6, waktu permintaan
-  completed_at   TIMESTAMPTZ,                -- R-13, waktu selesai
-  value_raw      TEXT        NOT NULL,       -- isi field R-4 apa adanya
-  components     JSONB       NOT NULL,       -- hasil split '^', urutan sesuai template
-  interpretation TEXT,                       -- 0 / A / B / AB / Pos / Neg / Dis
-  modified_flag  BOOLEAN     NOT NULL DEFAULT false,  -- nilai berawalan 'M' (M4+)
-  abnormal_flag  TEXT,                       -- R-7 (semua 'N' di file contoh)
-  result_status  TEXT,                       -- R-9, 'F' = final
-  order_status   TEXT,                       -- O-…, 'X' = sampel dibatalkan
-  operator       TEXT,                       -- R-11
-  instrument     TEXT,                       -- Erytra.pln / WADIANA^0000880^ERY
-  file_hash      CHAR(64) REFERENCES ingest_log(file_hash),
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (patient_id, test_code, requested_at)
+-- satu baris per hasil; inilah antrean yang dikirim ke Prima
+CREATE TABLE outbox (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key       TEXT    NOT NULL,           -- patient_id|test_code|requested_at
+  file_hash      TEXT    NOT NULL REFERENCES ingest_file(file_hash),
+  payload        TEXT    NOT NULL,           -- JSON yang dikirim apa adanya
+  status         TEXT    NOT NULL,           -- pending|sending|sent|failed_permanent
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,                      -- untuk backoff
+  http_status    INTEGER,
+  last_error     TEXT,
+  sent_at        TEXT,
+  UNIQUE (idem_key)
 );
+
+CREATE INDEX idx_outbox_pending ON outbox (status, next_attempt_at);
 ```
 
-Kolom `template` bukan pelengkap: tanpa itu, `components` tidak bisa ditafsirkan. `ABO2D.pln` punya 11 komponen, `3 Screen(AHG).pln` punya 5 — indeks yang sama berarti hal berbeda.
+Peran kedua `UNIQUE` berbeda, dan keduanya perlu:
 
-Kunci desainnya ada di dua `UNIQUE` dengan peran berbeda:
+- `ingest_file.file_hash` — file yang sama tidak diparse dua kali.
+- `outbox.idem_key` — hasil yang sama tidak dikirim dua kali, **meski datang dari file ekspor berbeda**. Nilai `idem_key` inilah yang juga dikirim sebagai `Idempotency-Key` ke Prima, sehingga duplikasi tertahan di kedua sisi.
 
-- `ingest_log.file_hash` — file yang sama tidak diproses dua kali.
-- `astm_result (patient_id, test_code, requested_at)` — hasil yang sama tidak masuk dua kali, **meski datang dari file ekspor yang berbeda**. Ini yang menyelamatkan Anda saat mesin mengekspor ulang rentang tanggal yang sama.
+Isi `payload` sengaja disimpan utuh (bukan hasil normalisasi), supaya kalau kontrak Prima berubah, Anda bisa mengirim ulang dari arsip tanpa membaca ulang file mesin.
+
+Karena SQLite ini hanya penyangga, tabel `outbox` boleh dipangkas berkala: `DELETE FROM outbox WHERE status='sent' AND sent_at < date('now','-30 day')`. Arsip file di `archive/` tetap disimpan lebih lama — itulah bukti mentah Anda satu-satunya.
 
 ---
 
@@ -513,22 +549,67 @@ Kunci desainnya ada di dua `UNIQUE` dengan peran berbeda:
 
 ```
 cmd/agent/main.go          # wiring + service
-internal/watcher/          # fsnotify + polling + gate kestabilan
+internal/watcher/          # fsnotify + polling + klaim (rename) + gate kestabilan
 internal/astm/             # parser E1394: record H/Q/P/O/R/L, split | dan ^
 internal/parser/           # registry template (.pln) + validasi → model domain
 internal/store/            # SQLite outbox
-internal/sender/           # retry + backoff + upsert
+internal/sender/           # POST ke Prima: retry, backoff, klasifikasi status
 internal/config/           # yaml + env
 internal/api/              # /healthz, /ingest-log (gin)
 configs/agent.example.yaml
 testdata/OUT_*.DAT         # file contoh dari repo 2.8 + variasi lain
 ```
 
-| Tahap | Isi | Kriteria selesai |
+**Konfigurasi — semua yang berubah di lapangan ada di sini, tanpa rebuild:**
+
+```yaml
+machine:
+  serial: "059-000-1027"          # dari machine.config lama
+  name: "ANGTHONG_IoT-1"
+
+inbox:
+  dir: "\\\\server\\lis-share"    # WAJIB dari config; bisa share jaringan
+  filename: "OUT.dat"             # nama tetap, cocokkan persis (case-insensitive)
+  poll_fallback: 30s              # pengaman kalau fsnotify tidak bekerja di share
+  claim: rename                   # rename | copy_verify_delete
+  delete_deadline: 30s            # dari Diana Server; hanya untuk alarm, bukan penundaan
+
+encoding: utf-8                   # utf-8 | windows-1252 (ANSI)
+
+spool:
+  dir: "C:\\Erytra\\spool"
+  archive_dir: "C:\\Erytra\\archive"
+  error_dir: "C:\\Erytra\\error"
+
+prima:
+  url: "https://prima.example/api/lab/result"   # dari tim Prima
+  method: POST
+  auth_header: "token"            # sesuaikan: token | Authorization
+  token_env: PRIMA_TOKEN          # kredensial dari env, bukan file ini
+  timeout: 10s
+  idempotency_header: "Idempotency-Key"
+  per_result: true                # true = satu POST per hasil; false = batch
+  retry:
+    max_attempts: 8
+    backoff: "1s,5s,30s,2m,5m"
+    retry_on_status: [429, 500, 502, 503, 504]
+    treat_409_as_success: true
+
+templates:                        # arti komponen per template .pln
+  "ABO2D.pln": [A.GD, B.GD, AB.GD, D.RH, "D'.RH", CTL.HM, A1.GI, B.GI, "Dir Gr", Rh, "Rev Gr"]
+  "3 Screen(AHG).pln": [I, II, III, "IA C", IA]
+
+log:
+  level: info
+  format: json
+  file: "C:\\Erytra\\logs\\agent.log"
+```
+
+Dua baris yang paling mudah salah: `inbox.filename` harus **`OUT.dat`** (bukan `*.dat`), dan `inbox.claim: rename` — bukan `copy` lalu `move` terpisah.| Tahap | Isi | Kriteria selesai |
 |---|---|---|
-| M1 | Watcher `OUT.dat` + salin + **hapus cepat** + arsip + log | Folder bersama kosong < 1 detik setelah file muncul; salinan utuh di arsip |
-| M2 | Parser ASTM + validator + `--dry-run` | 57 hasil dari `OUT_20240517103745.DAT` ter-parse benar, payload tercetak |
-| M3 | Outbox SQLite + sender + UPSERT | Matikan DB 5 menit → tidak ada data hilang, tidak ada duplikat |
+| M1 | Watcher `OUT.dat` + klaim via rename + spool + arsip + log | Folder bersama bersih < 1 detik setelah file muncul; file baru yang datang saat proses tidak ikut terhapus |
+| M2 | Parser ASTM + registry template + `--dry-run` | 57 hasil dari `OUT_20240517103745.DAT` ter-parse benar, payload tercetak |
+| M3 | Outbox SQLite + sender + klasifikasi 4xx/5xx | Prima dimatikan 5 menit → tidak ada data hilang, tidak ada duplikat; `400` tidak diulang |
 | M4 | Windows Service + config + `/healthz` | Reboot PC → service naik sendiri, data lanjut |
 | M5 | Uji dengan **Host Demo** + mini dashboard + notifikasi | Alur penuh teruji tanpa mesin; operator tahu < 1 menit kalau ada file gagal atau hasil `Dis` |
 
@@ -538,20 +619,22 @@ M3 adalah pembeda antara "script yang jalan" dan "tool yang bisa dipercaya". Jan
 
 ## 9. Yang perlu dikonfirmasi sebelum menulis kode
 
-Sudah terjawab oleh manual: **format file** (ASTM E1394), **nama file** (`OUT.dat`), **mekanisme kelengkapan** (rename atomik), **kewajiban hapus**, **encoding** (UTF-8/ANSI), **tipe record** (H/Q/P/O/R/L).
+Sudah terjawab:
 
-Yang masih harus diambil dari lapangan:
+- oleh manual: **format file** (ASTM E1394), **mekanisme kelengkapan** (rename atomik), **kewajiban hapus**, **encoding** (UTF-8/ANSI), **tipe record** (H/Q/P/O/R/L), **template menentukan layout**.
+- oleh lapangan: **nama file tetap `OUT.dat`**; **path folder dan timeout dinamis lewat config**; **tujuan = HTTP POST ke service Prima**, bukan database.
+
+Yang masih terbuka:
 
 | # | Yang ditanyakan | Kenapa penting | Cara mendapatkannya |
 |---|---|---|---|
-| 1 | **Path folder bersama** | Tidak ada nilai default; diisi di Diana Server | Lihat konfigurasi Diana Server (hal. 106) |
-| 2 | **Nilai Timeout** | Menentukan seberapa cepat `OUT.dat` wajib dihapus | Layar konfigurasi Diana Server |
-| 3 | **`OUT.dat` atau `OUT_<timestamp>.DAT`?** | File contoh bertimestamp, manual menyebut `OUT.dat` polos | Lihat isi folder di mesin |
+| 1 | **Kontrak API Prima** (URL, auth, body, kode respons) | Menentukan seluruh lapisan sender | Tim Prima — lihat tabel di bagian 5 |
+| 2 | **Nilai timeout sebenarnya** | Bukan untuk menunda hapus, tapi untuk menyetel alarm `/healthz` | Layar konfigurasi Diana Server (hal. 106) |
+| 3 | **Path folder bersama** | Mengisi `inbox.dir` di config | Konfigurasi Diana Server |
 | 4 | **Template `.pln` yang aktif** | Menentukan arti tiap komponen hasil | Listas.exe → Templates (hal. 117) |
-| 5 | **Database tujuan** | MySQL / Postgres / Odoo? "Update" = UPSERT atau UPDATE? | Kebijakan internal |
-| 6 | **Volume** | File per jam & ukuran | Log `DianaASTM.log` |
-| 7 | **Host Demo tersedia?** | Untuk uji tanpa mesin | Cek `E:\Data\SistemaDiana` (hal. 129) |
-| 8 | **3–4 file `.DAT` lain** | Memastikan variasi (nama pasien, `X` cancelled, `M4+`, file kosong) | Ekspor dari mesin |
+| 5 | **Volume** | File per jam & ukuran — menentukan perlu antrean atau tidak | Log `DianaASTM.log` |
+| 6 | **Host Demo tersedia?** | Untuk uji tanpa mesin | Cek `E:\Data\SistemaDiana` (hal. 129) |
+| 7 | **3–4 file `.DAT` lain** | Memastikan variasi (nama pasien, `X` cancelled, `M4+`, file kosong) | Ekspor dari mesin |
 
 Catatan: kalau ternyata integrasi berjalan di **mode serial atau TCP/IP**, pekerjaannya berbeda — perlu framing E1381 (ENQ/ACK/STX/checksum) dan itu bukan lagi "baca file". Pastikan dulu modenya file sharing.
 
