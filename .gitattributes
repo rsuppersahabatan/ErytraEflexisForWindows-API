@@ -1,0 +1,4 @@
+* text=auto
+# Berkas contoh ASTM harus byte-identik: CR/LF adalah pemisah record,
+# bukan sekadar akhir baris. Jangan biarkan git mengubahnya.
+testdata/*.dat -text

@@ -1,1 +1,6 @@
 .workbuddy-ai
+bin/
+*.exe
+*.db
+*.db-wal
+*.db-shm
