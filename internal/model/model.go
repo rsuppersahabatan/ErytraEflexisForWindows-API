@@ -15,11 +15,15 @@ type Result struct {
 	Components     []string
 	Interpretation string
 	Modified       bool
-	AbnormalFlag   string
-	ResultStatus   string
-	OrderStatus    string
-	Operator       string
-	Instrument     string
+	// Discrepancy menandai hasil yang tidak konsisten (nilai "Dis").
+	// Mesin tetap mengirim abnormal_flag "N" untuk hasil seperti ini, jadi
+	// tanpa field ini hasil yang meragukan lolos sebagai normal.
+	Discrepancy  bool
+	AbnormalFlag string
+	ResultStatus string
+	OrderStatus  string
+	Operator     string
+	Instrument   string
 }
 
 // IdemKey adalah kunci idempotency yang dikirim ke Prima sebagai Idempotency-Key.
@@ -41,13 +45,16 @@ type Payload struct {
 	Components     map[string]string `json:"components"`
 	Interpretation string            `json:"interpretation,omitempty"`
 	Modified       bool              `json:"modified"`
-	AbnormalFlag   string            `json:"abnormal_flag,omitempty"`
-	ResultStatus   string            `json:"result_status,omitempty"`
-	OrderStatus    string            `json:"order_status,omitempty"`
-	Operator       string            `json:"operator,omitempty"`
-	Instrument     string            `json:"instrument,omitempty"`
-	SourceFile     string            `json:"source_file"`
-	ReceivedAt     string            `json:"received_at"`
+	// Discrepancy dikirim eksplisit: penerima tidak boleh mengandalkan
+	// abnormal_flag, karena mesin menandai "Dis" sebagai normal.
+	Discrepancy  bool   `json:"discrepancy,omitempty"`
+	AbnormalFlag string `json:"abnormal_flag,omitempty"`
+	ResultStatus string `json:"result_status,omitempty"`
+	OrderStatus  string `json:"order_status,omitempty"`
+	Operator     string `json:"operator,omitempty"`
+	Instrument   string `json:"instrument,omitempty"`
+	SourceFile   string `json:"source_file"`
+	ReceivedAt   string `json:"received_at"`
 }
 
 // Envelope memasangkan hasil ternormalisasi dengan payload yang akan dikirim.

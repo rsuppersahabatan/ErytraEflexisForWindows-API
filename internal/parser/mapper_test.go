@@ -109,6 +109,25 @@ func TestDiscrepancyInterpretation(t *testing.T) {
 	}
 }
 
+// Mesin menandai hasil "Dis" sebagai abnormal_flag "N". Tanpa field sendiri,
+// hasil yang tidak konsisten itu lolos ke hilir seolah normal.
+func TestDiscrepancyIsFlaggedDespiteNormalFlag(t *testing.T) {
+	reg := testRegistry()
+	envs := reg.Map(sampleMessage(t), "OUT_sample.dat", time.Now())
+
+	if !envs[3].Payload.Discrepancy {
+		t.Error("env[3].Discrepancy = false, want true (nilai Dis)")
+	}
+	if got := envs[3].Payload.AbnormalFlag; got != "N" {
+		t.Errorf("AbnormalFlag = %q, want N — mesin memang mengirim normal", got)
+	}
+	for i := 0; i < 3; i++ {
+		if envs[i].Payload.Discrepancy {
+			t.Errorf("env[%d].Discrepancy = true, want false", i)
+		}
+	}
+}
+
 // Kunci idempotency tidak boleh bergantung pada berkas sumber.
 func TestIdemKeyStable(t *testing.T) {
 	reg := testRegistry()

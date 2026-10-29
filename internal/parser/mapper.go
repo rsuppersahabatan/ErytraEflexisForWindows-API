@@ -96,6 +96,7 @@ func (r *Registry) Map(msg *astm.Message, sourceFile string, receivedAt time.Tim
 				Components:     res.Components,
 				Interpretation: interpretation(res.Components, tpl, known),
 				Modified:       isModified(res.Components),
+				Discrepancy:    isDiscrepancy(res.Components),
 				AbnormalFlag:   res.AbnormalFlag,
 				ResultStatus:   res.Status,
 				OrderStatus:    order.Status,
@@ -162,6 +163,21 @@ func isModified(components []string) bool {
 	return false
 }
 
+// isDiscrepancy mendeteksi hasil yang tidak konsisten, ditandai "Dis" pada
+// salah satu komponen (lihat file contoh: `-^4+^Dis`).
+//
+// Deteksi ini harus ada di sini karena mesin tidak menandainya: abnormal flag
+// untuk hasil seperti itu tetap "N", jadi tanpa pemeriksaan sendiri hasil
+// meragukan akan lolos ke hilir seolah normal.
+func isDiscrepancy(components []string) bool {
+	for _, c := range components {
+		if strings.EqualFold(strings.TrimSpace(c), "dis") {
+			return true
+		}
+	}
+	return false
+}
+
 // BuildPayload menyusun JSON yang dikirim ke Prima.
 func BuildPayload(res model.Result, tpl Template, known bool, sourceFile string, receivedAt time.Time, loc *time.Location) model.Payload {
 	components := make(map[string]string, len(res.Components))
@@ -183,6 +199,7 @@ func BuildPayload(res model.Result, tpl Template, known bool, sourceFile string,
 		Components:     components,
 		Interpretation: res.Interpretation,
 		Modified:       res.Modified,
+		Discrepancy:    res.Discrepancy,
 		AbnormalFlag:   res.AbnormalFlag,
 		ResultStatus:   res.ResultStatus,
 		OrderStatus:    res.OrderStatus,

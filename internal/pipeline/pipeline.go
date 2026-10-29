@@ -11,6 +11,7 @@ import (
 
 	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/astm"
 	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/config"
+	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/model"
 	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/parser"
 	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/store"
 	"github.com/rsuppersahabatan/ErytraEflexisForWindows-API/internal/watcher"
@@ -75,6 +76,13 @@ func (p *Processor) Handle(c watcher.Claimed) error {
 		return p.fail(c, "validasi", fmt.Errorf("tidak ada hasil (record R) yang bisa dipetakan"))
 	}
 
+	// Hasil "Dis" tidak ditandai abnormal oleh mesin. Kalau tidak dilaporkan
+	// di sini, satu-satunya jejaknya adalah field discrepancy di payload.
+	if n := countDiscrepancy(envelopes); n > 0 {
+		p.log.Warn("hasil discrepancy (Dis) terdeteksi — perlu diperiksa operator",
+			"file", c.OriginalName, "jumlah", n, "dari", len(envelopes))
+	}
+
 	items := make([]store.EnqueueInput, 0, len(envelopes))
 	for _, env := range envelopes {
 		body, err := json.Marshal(env.Payload)
@@ -109,6 +117,16 @@ func countResults(msg *astm.Message) int {
 	n := 0
 	for _, o := range msg.Orders {
 		n += len(o.Results)
+	}
+	return n
+}
+
+func countDiscrepancy(envelopes []model.Envelope) int {
+	n := 0
+	for _, env := range envelopes {
+		if env.Result.Discrepancy {
+			n++
+		}
 	}
 	return n
 }
