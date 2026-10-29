@@ -1,7 +1,11 @@
-# Analisa 8 Repo NUT-ARNAJAKDEV + Rekomendasi Stack
+# Analisa 8 Repo NUT-ARNAJAKDEV + Manual Erytra Eflexis + Rekomendasi Stack
 ## Kebutuhan: baca file hasil mesin Erytra Eflexis di folder Windows → kirim ke database
 
 Organisasi GitHub: [NUT-ARNAJAKDEV](https://github.com/NUT-ARNAJAKDEV) · Tanggal analisa: 29 Oktober 2026
+
+Sumber:
+- 8 repo di [github.com/NUT-ARNAJAKDEV](https://github.com/NUT-ARNAJAKDEV)
+- `01. ErytraEflexis Configuration Guide_0.01.pdf` — *Erytra Eflexis® Configuration Guide*, DxCTS, SEP 2020 (133 halaman)
 
 | # | Repo | Bahasa utama |
 |---|---|---|
@@ -14,7 +18,10 @@ Organisasi GitHub: [NUT-ARNAJAKDEV](https://github.com/NUT-ARNAJAKDEV) · Tangga
 | 7 | [Emtry-and-countdown](https://github.com/NUT-ARNAJAKDEV/Emtry-and-countdown) | Go, Batchfile |
 | 8 | [Copy-file-automation](https://github.com/NUT-ARNAJAKDEV/Copy-file-automation) | Batchfile |
 
-> **Temuan terpenting ada di bagian 2.9**: file `.DAT` dari mesin bukan log bebas, melainkan **ASTM E1394** — protokol standar alat laboratorium. Ini mengubah desain parser dan strategi idempotency.
+> **Tiga temuan yang menentukan desain, semuanya di bagian 2.9 dan 2.10:**
+> 1. File `.DAT` adalah **ASTM E1394**, bukan log bebas.
+> 2. Diana Server menulis `TX_TMP.dat` lalu **rename ke `OUT.dat`** → rename itu sendiri adalah penanda "file selesai".
+> 3. **`OUT.dat` wajib dihapus oleh sisi LIS**; kalau tidak, mesin memunculkan error setelah timeout. Ini membalik prioritas desain: hapus cepat, proses belakangan.
 
 ---
 
@@ -242,6 +249,109 @@ Ini juga menjelaskan kenapa pipeline VBS di IOT-Gateway begitu berbelit: mereka 
 
 ---
 
+### 2.10 Manual konfigurasi resmi: kontrak integrasi yang sebenarnya
+
+Sumber: `01. ErytraEflexis Configuration Guide_0.01.pdf` (DxCTS, SEP 2020). Bagian LIS ada di halaman 92–127.
+
+#### Tiga kanal fisik, dan mana yang relevan
+
+| Kanal | Cara kerja | Untuk kasus Anda |
+|---|---|---|
+| Serial (COM 1/2/3) | Frame bernomor, handshake ACK/NAK, checksum | Tidak — butuh kabel & framing E1381 |
+| **File sharing** | Tukar file `OUT.dat` / `IN.dat` di folder bersama | **Ya, ini yang dipakai** |
+| TCP/IP | Port default 8888, protokol https ke Diana Server | Tidak — butuh listener, bukan folder |
+
+Keduanya (serial & TCP) memerlukan framing E1381. **Mode file sharing tidak** — cukup baca/tulis file. Inilah alasan parser 150 baris tadi sudah cukup.
+
+#### Kontrak pertukaran file (hal. 97–100)
+
+| Arah | File | Siapa yang membuat | Siapa yang menghapus |
+|---|---|---|---|
+| Analyser → LIS | `TX_TMP.dat` → **rename** → `OUT.dat` | Diana Server | **LIS (tool Anda)** |
+| LIS → Analyser | `IN.dat` | LIS (tool Anda) | Diana Server |
+
+Detail yang menentukan desain:
+
+1. **Diana Server menulis `TX_TMP.dat` dulu, lalu me-rename menjadi `OUT.dat` setelah selesai.** Rename di filesystem bersifat atomik — jadi **keberadaan `OUT.dat` sudah berarti file lengkap**. Tidak perlu menebak dari ukuran/mtime.
+2. **"LIS deletes OUT.DAT when received. If not deleted within a defined timeout period, error messages are generated."** (hal. 99). Ini kewajiban, bukan pilihan: kalau tool Anda lambat menghapus, **mesin yang menampilkan error**.
+3. `IN.dat` adalah permintaan worklist dari LIS ke alat. Diana Server mendeteksi, menghapus, lalu meneruskan isinya ke instrumen. Kalau tidak dihapus dalam timeout, file dihapus otomatis **dan** error dicatat (hal. 100).
+4. "The exchange common folder should be unique" — satu folder bersama per instrumen, jangan dipakai dua alat.
+
+**Konsekuensi desain yang penting:** urutan kerja tool Anda harus **salin → hapus `OUT.dat` → baru parse & kirim**. Bukan sebaliknya. IOT-Gateway melakukan kebalikannya (hapus hanya kalau HTTP 200), sehingga kalau API lambat atau mati, `OUT.dat` mengendap dan mesin memunculkan error.
+
+#### Tipe record ASTM yang benar (hal. 119)
+
+Manual menyebut enam tipe: `H` (header), `L` (terminator), **`Q` (query)**, `P` (patient), `O` (order), `R` (result).
+
+IOT-Gateway hanya menangani `P`/`O`/`R`. **`Q` tidak ditangani** — padahal di mode bidirectional, `Q` adalah record pertama yang datang (`Q|1|ALL||ALL||||||||I|` untuk Query All, atau `Q|1|^=E00251711038521^||ALL|…` untuk Query by Sample). Kalau tool Anda membaca folder yang sama, record `Q` akan muncul dan harus dikenali (minimal diabaikan dengan benar, bukan bikin parser gagal).
+
+#### Identitas pengirim menjelaskan asal file contoh
+
+| Isi field `H` | Arti |
+|---|---|
+| `WADIANA^0000880^ERY` | Komunikasi **bidirectional** — alat menjawab permintaan LIS (serial asli `0000880`) |
+| `REPORT^000^ERY` | **Forwarding hasil yang sudah ada** — pengiriman unidirectional, tanpa LIS |
+
+File contoh di repo 2.8 memakai `REPORT^000^ERY`. Artinya file itu **bukan** hasil komunikasi LIS normal, melainkan ekspor/forward hasil — konsisten dengan namanya yang bertimestamp (`OUT_20240517103745.DAT`) dan bukan `OUT.dat` polos. Ini perlu dikonfirmasi ke lapangan: apakah produksi memakai `OUT.dat` (sesuai manual) atau file bertimestamp (hasil ekspor manual).
+
+#### Template (`Plantillas`) menentukan arti kolom hasil (hal. 115–118)
+
+Ini bagian yang paling sering diremehkan. Isi field hasil **bergantung pada template `.pln`** yang dipilih, dan nama template ikut dikirim di record `R`:
+
+```
+R|1|^^^DGW11E.gru^3 Screen(AHG).pln|3+^3+^-^Pos^Pos|I.IAC^II.IAC^III.IAC^IA C^IA||N||F||ADMIN|...
+R|1|^^^DGW01J.gru^ABO2D.pln|M4+^-^4+^-^-^-^-^3+^A^Neg^A|A.GD^B.GD^AB.GD^D.RH^D'.RH^CTL.HM^A1.GI^B.GI^Dir Gr^Rh^Rev Gr||N||F||...
+```
+
+Contoh dari manual:
+
+| Template | Komponen hasil |
+|---|---|
+| `3 Screen(AHG).pln` | 5 komponen: `3+^3+^-^Pos^Pos` |
+| `ABO2D.pln` | 11 komponen: A.GD, B.GD, AB.GD, D.RH, D'.RH, CTL.HM, A1.GI, B.GI, Dir Gr, Rh, Rev Gr |
+| `abo.gru^Erytra.pln` (file contoh) | 9 komponen: `^^^-^4+^^B^` |
+
+Jadi **jumlah dan arti komponen tidak tetap antar tes**. Inilah bukti keras bahwa pendekatan `lines[0]…lines[26]` di `update.go` salah secara struktural — bukan cuma rapuh, tapi memang tidak bisa benar untuk lebih dari satu template.
+
+Segment yang paling umum dipakai: Bloodgroup (Group), Rh, Group Rh, IA (antibody screening interpretation), Rh Pheno.
+
+#### Nilai khusus di dalam field hasil
+
+| Tanda | Arti | Sumber |
+|---|---|---|
+| `M4+` | Nilai **dimodifikasi manual** oleh operator | hal. 127 |
+| `Dis` | Discrepancy — hasil tidak konsisten | file contoh |
+| `Pos` / `Neg` | Interpretasi kualitatif | hal. 126 |
+| Status `X` di record `O` | Sampel **dibatalkan** (cancelled) | hal. 125 |
+
+Keempatnya harus disimpan apa adanya, dan `M4+`/`Dis`/`X` sebaiknya memicu peringatan — bukan diperlakukan sebagai hasil normal.
+
+#### Pengaturan yang memengaruhi tool Anda
+
+| Parameter | Lokasi | Efek |
+|---|---|---|
+| `LIS_ACTIVATED` | `erytra.properties` (hal. 50) | Harus `true`, kalau tidak tidak ada file sama sekali |
+| `LIS_SHARED_MODE` | `erytra.properties` (hal. 51) | `true` → sampel di luar alat dikirim balik sebagai **cancelled** (record `O` status `X`) |
+| `LIS_AUTO_QUERY_BY_SAMPLE` | `erytra.properties` (hal. 53) | Query otomatis per sampel → record `Q` lebih sering muncul |
+| `RECEIVED_AND_SHOW_DEMOGRAPHIC_DATA` | `erytra.properties` (hal. 104) | Data nama/tanggal lahir/gender bisa ikut terkirim (khusus versi CE) |
+| **LIS Encoding** | Diana Server (hal. 107) | **UTF-8 default; ANSI dipakai untuk Host Demo** → parser wajib mendukung keduanya |
+| **Timeout** | Diana Server (hal. 106) | Batas waktu tool Anda harus menghapus `OUT.dat` |
+| `SendBCReacSupp = 1` | Registry Windows (hal. 104) | Mengirim barcode kartu & reagen ke LIS — inilah asal data "card" di IOT-Gateway |
+
+#### Alat uji yang sudah tersedia: Host Demo (hal. 129–133)
+
+Software ini menyertakan **Host Demo** — program yang **mensimulasikan LIS**, ada di `E:\Data\SistemaDiana`, dengan jendela *Pending samples* dan *Received results*. Fungsinya persis: "isolates the problem to either Diana Server or Customer LIS".
+
+Artinya: **tool Anda bisa diuji tanpa mesin dan tanpa LIS asli.** Konfigurasi Host Demo harus sama dengan konfigurasi Diana Server, barcode sampel harus sama dengan yang di alat, dan nama tes harus sama dengan profil `.gru` yang aktif (lihat `DSC.def` / `DSC_Custom.def`). Ini menghapus alasan "belum bisa dites karena mesinnya sedang dipakai".
+
+#### Yang tidak dijawab manual ini
+
+- **Path folder bersama** tidak disebutkan (diisi di Diana Server, bukan nilai default) — harus ditanyakan ke lapangan.
+- **Nilai timeout** tidak menyebut angka — harus dilihat di layar konfigurasi Diana Server.
+- Apakah produksi memakai `OUT.dat` atau `OUT_<timestamp>.DAT`.
+
+---
+
 ## 3. Rekapitulasi
 
 | Repo | Bahasa | Fungsi asli | Kesesuaian | Yang diambil |
@@ -262,17 +372,20 @@ Nilai sesungguhnya dari kedelapan repo ini ada di dua hal, bukan di kodenya:
 1. **Pengetahuan domain** — pemetaan `case*.config` dan kontrak payload JSON-RPC.
 2. **Satu file contoh asli** (`OUT_20240517103745.DAT`) yang membuktikan formatnya ASTM E1394 — ini yang menentukan desain parser, dan justru tidak dipakai oleh repo mana pun di atas.
 
+Dan nilai terbesar dari seluruh bahan yang dianalisa justru ada di **manual konfigurasi**, bukan di repo: kontrak `TX_TMP.dat` → `OUT.dat`, kewajiban menghapus file, dan fakta bahwa tata letak hasil ditentukan template. Ketiganya tidak bisa disimpulkan dari kode mana pun di GitHub itu — hanya dari manual dan pengamatan lapangan.
+
 ---
 
-## 4. Tujuh aturan yang wajib ada di tool baru
+## 4. Delapan aturan yang wajib ada di tool baru
 
-1. **File belum tentu selesai ditulis.** Jangan proses saat `CREATE`. Untuk file `.DAT` ASTM, **record `L|1|N` adalah bukti terkuat file sudah lengkap** — jadikan itu gate utama, lalu tambahkan cek ukuran + mtime tidak berubah selama 2–3 detik sebagai lapis kedua, dan buka dengan `FILE_SHARE_NONE`. Kalau gagal → coba lagi, jangan pindahkan.
-2. **Idempotency per hasil, bukan per file.** Satu file ASTM berisi puluhan hasil. Kunci alaminya `(patient_id, test_code, requested_at)` dengan `UNIQUE`; hash file hanya untuk mencegah file yang sama diproses dua kali di tingkat berkas.
-3. **Outbox lokal.** Tulis payload ke SQLite dulu, baru kirim. DB/API mati → data tetap aman dan terkirim saat pulih. Ini pengganti `standby.log` yang rapuh.
-4. **Jangan hapus, arsipkan.** `inbox/` → `processing/` → `archive/YYYY-MM-DD/`. Gagal parse → `error/` + alasan di log.
-5. **Validasi eksplisit, bukan positional.** Setiap field punya nama, tipe, dan aturan wajib. Record tidak valid ditolak **dengan alasan**, tidak dihapus.
-6. **Jangan hardcode waktu & path.** Timezone dari config (`Asia/Jakarta`), path dari config, kredensial dari env/secret.
-7. **Observable.** Log JSON terstruktur, `/healthz`, jumlah antrean, file terakhir diproses, error terakhir. Tanpa ini, kegagalan di lantai produksi tidak akan ketahuan sampai ada yang komplain.
+1. **Kelengkapan file dibuktikan mesin, bukan ditebak.** Mode file sharing: Diana Server menulis `TX_TMP.dat` lalu **rename** ke `OUT.dat` — rename atomik, jadi `OUT.dat` yang muncul sudah utuh. Lapis kedua: record `L|1|N`; lapis ketiga: ukuran + mtime diam 2–3 detik. **Jangan pernah memantau `*.dat`** — `TX_TMP.dat` juga `.dat` dan isinya setengah jadi.
+2. **Hapus `OUT.dat` secepat mungkin — itu kewajiban protokol, bukan kerapian.** Manual (hal. 99): kalau LIS tidak menghapus dalam timeout, mesin memunculkan error. Urutan yang benar: **salin → hapus `OUT.dat` → baru parse & kirim**. Kegagalan DB tidak boleh menahan file di folder bersama.
+3. **Idempotency per hasil, bukan per file.** Satu file ASTM berisi puluhan hasil. Kunci alaminya `(patient_id, test_code, requested_at)` dengan `UNIQUE`; hash file hanya untuk mencegah file yang sama diproses dua kali di tingkat berkas.
+4. **Outbox lokal.** Tulis payload ke SQLite dulu, baru kirim. DB/API mati → data tetap aman dan terkirim saat pulih. Ini pengganti `standby.log` yang rapuh.
+5. **Arsipkan salinan Anda sendiri, bukan file mesin.** `inbox/` → `processing/` → `archive/YYYY-MM-DD/`. Gagal parse → `error/` + alasan di log.
+6. **Validasi eksplisit, bukan positional.** Setiap field punya nama dan tipe; komponen hasil ditafsirkan **berdasarkan nama template** (`ABO2D.pln`, `3 Screen(AHG).pln`), bukan indeks tetap.
+7. **Jangan hardcode waktu, path, encoding, kredensial.** Timezone dari config, path dari config, encoding UTF-8/ANSI dari config (Diana Server mendukung keduanya, hal. 107).
+8. **Observable.** Log JSON terstruktur, `/healthz`, jumlah antrean, file terakhir diproses, error terakhir, dan **waktu hapus `OUT.dat`** (untuk memantau apakah masih di bawah timeout).
 
 ---
 
@@ -283,7 +396,7 @@ Nilai sesungguhnya dari kedelapan repo ini ada di dua hal, bukan di kodenya:
 | Lapisan | Pilihan | Alasan |
 |---|---|---|
 | Watcher | `fsnotify` + polling cadangan 30 detik | Event tidak reliable di share jaringan/mapped drive — polling menyelamatkan |
-| Parser | **ASTM E1394** (tulis sendiri, ~150 baris) + adapter cadangan | Format `.DAT` sudah baku: split `\|` lalu `^`. Tidak perlu regex |
+| Parser | **ASTM E1394** (tulis sendiri, ~150 baris) + registry template | Format baku: split `\|` lalu `^`. Arti komponen dari nama template `.pln`, bukan indeks tetap |
 | Gate kestabilan | record `L\|1\|N` + cek `size`/`mtime` 2× + buka eksklusif | Solusi masalah #1 di atas, dengan bukti dari mesin sendiri |
 | Encoding | `golang.org/x/text/encoding` (charmap/unicode) | Ganti `Windows-1252` hardcoded |
 | Outbox | `modernc.org/sqlite` (pure Go, tanpa CGO) | Tanpa compiler C, binary tetap satu file |
@@ -319,11 +432,14 @@ Pilih ini kalau: butuh GUI konfigurasi (WPF) menyatu dengan service, atau lingku
 ## 6. Arsitektur yang direkomendasikan
 
 ```
-[Erytra Eflexis] → tulis OUT_*.DAT → C:\Erytra\inbox\
-                                      ↓  (watcher: menunggu record L|1|N)
-                              C:\Erytra\processing\   ← klaim atomik (rename)
-                                      ↓
-                    parser ASTM E1394 → N hasil (H/P/O/R/L)
+[Diana Server] tulis TX_TMP.dat → rename → OUT.dat   (folder bersama, unik)
+                                            ↓  (watcher: nama persis "OUT.dat")
+                                  salin isi ke spool lokal
+                                            ↓
+                              HAPUS OUT.dat  ← dalam hitungan detik,
+                                            │   sebelum timeout mesin
+                                            ↓
+                            parse ASTM E1394 → N hasil (H/Q/P/O/R/L)
                              ↓ gagal            ↓ valid
                      C:\Erytra\error\      outbox SQLite (N payload + status)
                      (+ alasan di log)          ↓
@@ -335,7 +451,12 @@ Pilih ini kalau: butuh GUI konfigurasi (WPF) menyatu dengan service, atau lingku
                                     C:\Erytra\archive\YYYY-MM-DD\
 ```
 
-Satu binary, dua goroutine: **watcher** dan **sender**. Keduanya tidak saling menunggu — DB lambat tidak menghentikan pembacaan file. Satu file masuk → satu transaksi berisi N baris hasil; kalau satu baris gagal validasi, seluruh file masuk `error/` agar tidak ada hasil yang setengah masuk.
+Dua jalur dengan prioritas berbeda, dan itu disengaja:
+
+- **Jalur cepat (milidetik–detik):** salin + hapus `OUT.dat`. Tidak menyentuh database sama sekali, jadi tidak bisa gagal karena DB.
+- **Jalur lambat (bisa menit):** parse + validasi + kirim + retry. Boleh gagal berkali-kali tanpa mengganggu mesin.
+
+Inilah pembeda utama dengan IOT-Gateway, yang menghapus `OUT.dat` hanya setelah HTTP 200 — sehingga gangguan API langsung berubah menjadi error di layar mesin.
 
 ---
 
@@ -361,20 +482,25 @@ CREATE TABLE astm_result (
   id             BIGSERIAL PRIMARY KEY,
   patient_id     TEXT        NOT NULL,       -- P-3, MRN pasien
   test_code      TEXT        NOT NULL,       -- abo.gru, DGW11E.gru, …
+  template       TEXT,                       -- ABO2D.pln, 3 Screen(AHG).pln
   requested_at   TIMESTAMPTZ NOT NULL,       -- O-6, waktu permintaan
   completed_at   TIMESTAMPTZ,                -- R-13, waktu selesai
   value_raw      TEXT        NOT NULL,       -- isi field R-4 apa adanya
-  components     JSONB       NOT NULL,       -- hasil split '^'
-  interpretation TEXT,                       -- 0 / A / B / AB / Dis
+  components     JSONB       NOT NULL,       -- hasil split '^', urutan sesuai template
+  interpretation TEXT,                       -- 0 / A / B / AB / Pos / Neg / Dis
+  modified_flag  BOOLEAN     NOT NULL DEFAULT false,  -- nilai berawalan 'M' (M4+)
   abnormal_flag  TEXT,                       -- R-7 (semua 'N' di file contoh)
   result_status  TEXT,                       -- R-9, 'F' = final
+  order_status   TEXT,                       -- O-…, 'X' = sampel dibatalkan
   operator       TEXT,                       -- R-11
-  instrument     TEXT,                       -- Erytra.pln
+  instrument     TEXT,                       -- Erytra.pln / WADIANA^0000880^ERY
   file_hash      CHAR(64) REFERENCES ingest_log(file_hash),
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (patient_id, test_code, requested_at)
 );
 ```
+
+Kolom `template` bukan pelengkap: tanpa itu, `components` tidak bisa ditafsirkan. `ABO2D.pln` punya 11 komponen, `3 Screen(AHG).pln` punya 5 — indeks yang sama berarti hal berbeda.
 
 Kunci desainnya ada di dua `UNIQUE` dengan peran berbeda:
 
@@ -388,8 +514,8 @@ Kunci desainnya ada di dua `UNIQUE` dengan peran berbeda:
 ```
 cmd/agent/main.go          # wiring + service
 internal/watcher/          # fsnotify + polling + gate kestabilan
-internal/astm/             # parser E1394: record H/P/O/R/L, split | dan ^
-internal/parser/           # validasi + normalisasi → model domain
+internal/astm/             # parser E1394: record H/Q/P/O/R/L, split | dan ^
+internal/parser/           # registry template (.pln) + validasi → model domain
 internal/store/            # SQLite outbox
 internal/sender/           # retry + backoff + upsert
 internal/config/           # yaml + env
@@ -400,11 +526,11 @@ testdata/OUT_*.DAT         # file contoh dari repo 2.8 + variasi lain
 
 | Tahap | Isi | Kriteria selesai |
 |---|---|---|
-| M1 | Watcher + gate `L|1|N` + arsip + log | File setengah jadi tidak pernah terkirim |
+| M1 | Watcher `OUT.dat` + salin + **hapus cepat** + arsip + log | Folder bersama kosong < 1 detik setelah file muncul; salinan utuh di arsip |
 | M2 | Parser ASTM + validator + `--dry-run` | 57 hasil dari `OUT_20240517103745.DAT` ter-parse benar, payload tercetak |
 | M3 | Outbox SQLite + sender + UPSERT | Matikan DB 5 menit → tidak ada data hilang, tidak ada duplikat |
 | M4 | Windows Service + config + `/healthz` | Reboot PC → service naik sendiri, data lanjut |
-| M5 | Mini dashboard + notifikasi (Telegram/WA) | Operator tahu dalam < 1 menit kalau ada file gagal, atau ada hasil `Dis` |
+| M5 | Uji dengan **Host Demo** + mini dashboard + notifikasi | Alur penuh teruji tanpa mesin; operator tahu < 1 menit kalau ada file gagal atau hasil `Dis` |
 
 M3 adalah pembeda antara "script yang jalan" dan "tool yang bisa dipercaya". Jangan lewati.
 
@@ -412,12 +538,22 @@ M3 adalah pembeda antara "script yang jalan" dan "tool yang bisa dipercaya". Jan
 
 ## 9. Yang perlu dikonfirmasi sebelum menulis kode
 
-1. ~~**Format file dari mesin**~~ — **sudah terjawab**: ASTM E1394 (lihat 2.9). Yang masih perlu: 3–4 file `.DAT` lain untuk memastikan variasinya konsisten (mis. hasil dengan nama pasien, tes selain golongan darah, file kosong, file terpotong).
-2. **Nama & lokasi folder** — lokal (`C:\...`) atau share jaringan (`\\server\...`)? Share jaringan mengubah strategi watcher.
-3. **Database tujuan** — MySQL / Postgres / Odoo / lain? Dan apakah "update data" berarti UPSERT atau UPDATE baris yang sudah ada?
-4. **Volume** — berapa file per jam, dan ukuran rata-rata? Menentukan perlu antrean atau cukup satu goroutine.
-5. **PC-nya** — dedicated atau dipakai bersama software mesin? Menentukan budget RAM dan cara instalasi.
-6. **Apakah mesin juga mengirim via serial/TCP (LIS1-A)?** Kalau ya, framing E1381 (ENQ/ACK/STX/checksum) perlu ditangani terpisah — dan itu pekerjaan yang berbeda dari membaca file.
+Sudah terjawab oleh manual: **format file** (ASTM E1394), **nama file** (`OUT.dat`), **mekanisme kelengkapan** (rename atomik), **kewajiban hapus**, **encoding** (UTF-8/ANSI), **tipe record** (H/Q/P/O/R/L).
+
+Yang masih harus diambil dari lapangan:
+
+| # | Yang ditanyakan | Kenapa penting | Cara mendapatkannya |
+|---|---|---|---|
+| 1 | **Path folder bersama** | Tidak ada nilai default; diisi di Diana Server | Lihat konfigurasi Diana Server (hal. 106) |
+| 2 | **Nilai Timeout** | Menentukan seberapa cepat `OUT.dat` wajib dihapus | Layar konfigurasi Diana Server |
+| 3 | **`OUT.dat` atau `OUT_<timestamp>.DAT`?** | File contoh bertimestamp, manual menyebut `OUT.dat` polos | Lihat isi folder di mesin |
+| 4 | **Template `.pln` yang aktif** | Menentukan arti tiap komponen hasil | Listas.exe → Templates (hal. 117) |
+| 5 | **Database tujuan** | MySQL / Postgres / Odoo? "Update" = UPSERT atau UPDATE? | Kebijakan internal |
+| 6 | **Volume** | File per jam & ukuran | Log `DianaASTM.log` |
+| 7 | **Host Demo tersedia?** | Untuk uji tanpa mesin | Cek `E:\Data\SistemaDiana` (hal. 129) |
+| 8 | **3–4 file `.DAT` lain** | Memastikan variasi (nama pasien, `X` cancelled, `M4+`, file kosong) | Ekspor dari mesin |
+
+Catatan: kalau ternyata integrasi berjalan di **mode serial atau TCP/IP**, pekerjaannya berbeda — perlu framing E1381 (ENQ/ACK/STX/checksum) dan itu bukan lagi "baca file". Pastikan dulu modenya file sharing.
 
 ---
 
@@ -445,6 +581,9 @@ M3 adalah pembeda antara "script yang jalan" dan "tool yang bisa dipercaya". Jan
 
 **File contoh ASTM E1394 (paling penting):**
 [`OUT_20240517103745.DAT`](https://github.com/NUT-ARNAJAKDEV/Copy-file-automation/blob/main/Source/OUT_20240517103745.DAT) — 173 baris, 57 hasil, 23 pasien, 5 kode tes.
+
+**Manual konfigurasi (lokal):**
+`01. ErytraEflexis Configuration Guide_0.01.pdf` — halaman kunci: 50–53 (properti LIS), 97–100 (file sharing), 106–107 (timeout & encoding), 115–118 (template), 119–127 (ASTM), 129–133 (Host Demo).
 
 File kunci di IOT-Gateway (untuk dibaca ulang saat implementasi):
 
