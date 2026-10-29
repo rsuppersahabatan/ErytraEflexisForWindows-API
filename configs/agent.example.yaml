@@ -20,8 +20,14 @@ inbox:
   # "rename" = satu operasi atomik (klaim + folder bersih sekaligus).
   # "copy_verify_delete" = cadangan bila ACL share menolak rename.
   claim: rename
+  # Gate kestabilan: lama berkas harus diam (ukuran+mtime tidak berubah)
+  # sebelum diklaim. 0 = langsung klaim, dan itu yang benar untuk alur Diana
+  # karena TX_TMP.dat di-rename secara atomik. Isi mis. 2s hanya bila folder
+  # bersama diisi dengan cara lain (operator menyalin berkas manual).
+  stability: 0
   # Nilai Timeout di Diana Server. Hanya dipakai untuk alarm kesehatan,
-  # bukan untuk menunda penghapusan.
+  # bukan untuk menunda penghapusan. Juga menjadi batas berkas kosong boleh
+  # dibiarkan di folder bersama sebelum dipindahkan ke folder error.
   delete_deadline: 30s
 
 # LIS Encoding di Diana Server: utf-8 (default) atau windows-1252 (ANSI).

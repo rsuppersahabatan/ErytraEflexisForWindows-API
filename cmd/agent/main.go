@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -167,7 +169,8 @@ func (p *program) run(ctx context.Context) {
 
 	w := watcher.New(
 		cfg.Inbox.Dir, cfg.Inbox.Filename, cfg.Inbox.Claim,
-		cfg.Inbox.PollInterval.D(), cfg.Spool.Dir, cfg.Spool.ErrorDir, log,
+		cfg.Inbox.PollInterval.D(), cfg.Inbox.Stability.D(), cfg.Inbox.DeleteDeadline.D(),
+		cfg.Spool.Dir, cfg.Spool.ErrorDir, log,
 	)
 
 	snd := sender.New(cfg, st, log)
@@ -222,7 +225,14 @@ func (p *program) run(ctx context.Context) {
 func runParse(configPath, file string) error {
 	cfg, err := config.LoadLenient(configPath)
 	if err != nil {
-		return err
+		// Mode ini harus bisa dicoba sebelum configs/agent.yaml dibuat: parser
+		// hanya butuh encoding, template, dan identitas mesin, semuanya punya
+		// nilai bawaan. Konfigurasi yang ada tapi rusak tetap dilaporkan.
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		cfg = config.Default()
+		fmt.Fprintf(os.Stderr, "catatan: %s tidak ada, memakai nilai bawaan\n", configPath)
 	}
 
 	raw, err := os.ReadFile(file)

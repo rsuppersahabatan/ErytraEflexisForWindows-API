@@ -130,7 +130,8 @@ func TestEndToEnd(t *testing.T) {
 	reg := parser.NewRegistry(cfg.Templates, cfg.Machine.Serial, cfg.Location())
 	proc := New(cfg, st, reg, log)
 	w := watcher.New(cfg.Inbox.Dir, cfg.Inbox.Filename, cfg.Inbox.Claim,
-		cfg.Inbox.PollInterval.D(), cfg.Spool.Dir, cfg.Spool.ErrorDir, log)
+		cfg.Inbox.PollInterval.D(), cfg.Inbox.Stability.D(), cfg.Inbox.DeleteDeadline.D(),
+		cfg.Spool.Dir, cfg.Spool.ErrorDir, log)
 	snd := sender.New(cfg, st, log)
 
 	ctx, cancel := context.WithCancel(context.Background())

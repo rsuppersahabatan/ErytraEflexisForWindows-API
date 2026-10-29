@@ -15,6 +15,11 @@ const payload = "H|\\^&|||REPORT^000^ERY|||||||P|1|20261029120000\nL|1|N\n"
 
 func newTestWatcher(t *testing.T, claim string) (*Watcher, string, string) {
 	t.Helper()
+	return newTestWatcherOpts(t, claim, 0, 30*time.Second)
+}
+
+func newTestWatcherOpts(t *testing.T, claim string, stability, deadline time.Duration) (*Watcher, string, string) {
+	t.Helper()
 	root := t.TempDir()
 	shared := filepath.Join(root, "share")
 	spool := filepath.Join(root, "spool")
@@ -26,7 +31,7 @@ func newTestWatcher(t *testing.T, claim string) (*Watcher, string, string) {
 		}
 	}
 
-	w := New(shared, "OUT.dat", claim, time.Second, spool, errDir,
+	w := New(shared, "OUT.dat", claim, time.Second, stability, deadline, spool, errDir,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return w, shared, spool
 }
@@ -162,5 +167,82 @@ func TestNoFileNoClaim(t *testing.T) {
 	})
 	if called {
 		t.Error("handler dipanggil padahal hanya ada TX_TMP.dat")
+	}
+}
+
+// Berkas 0 byte berarti Diana masih menulis. Mengklaimnya lewat rename berarti
+// memindahkan transaksi yang sedang berjalan, dan hasilnya tidak akan pernah
+// sampai ke LIS. Tetapi berkas itu juga tidak boleh dibiarkan selamanya:
+// folder bersama wajib bersih sebelum timeout mesin.
+func TestEmptyFileWaitsUntilDeadline(t *testing.T) {
+	w, shared, _ := newTestWatcherOpts(t, "rename", 0, 80*time.Millisecond)
+	write(t, shared, "OUT.dat", "")
+
+	claims := 0
+	handle := func(c Claimed) error { claims++; return nil }
+
+	w.tick(handle)
+	if claims != 0 {
+		t.Fatalf("berkas kosong langsung diklaim (%d klaim), want 0", claims)
+	}
+	if _, err := os.Stat(filepath.Join(shared, "OUT.dat")); err != nil {
+		t.Fatal("berkas kosong hilang dari folder bersama padahal belum lewat deadline")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	w.tick(handle)
+	if claims != 1 {
+		t.Fatalf("klaim setelah deadline = %d, want 1 (folder bersama harus bersih)", claims)
+	}
+	if _, err := os.Stat(filepath.Join(shared, "OUT.dat")); !os.IsNotExist(err) {
+		t.Error("berkas kosong masih di folder bersama setelah lewat deadline")
+	}
+}
+
+// Gate kestabilan: berkas yang ukurannya masih berubah tidak boleh diklaim.
+func TestStabilityGateWaitsForSettledFile(t *testing.T) {
+	w, shared, _ := newTestWatcherOpts(t, "rename", 120*time.Millisecond, 30*time.Second)
+	p := filepath.Join(shared, "OUT.dat")
+
+	claims := 0
+	var last Claimed
+	handle := func(c Claimed) error { claims++; last = c; return nil }
+
+	const head = "H|\\^&|||REPORT^000^ERY|||||||P|1|20261029120000\n"
+	write(t, shared, "OUT.dat", head)
+
+	w.tick(handle)
+	if claims != 0 {
+		t.Fatalf("klaim sebelum berkas diam (%d), want 0", claims)
+	}
+
+	// Berkas masih bertambah: penghitung kestabilan harus mulai dari nol lagi.
+	time.Sleep(40 * time.Millisecond)
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("buka berkas: %v", err)
+	}
+	if _, err := f.WriteString("L|1|N\n"); err != nil {
+		t.Fatalf("tulis berkas: %v", err)
+	}
+	f.Close()
+	w.tick(handle)
+	if claims != 0 {
+		t.Fatalf("klaim padahal ukuran baru berubah (%d), want 0", claims)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	w.tick(handle)
+	if claims != 1 {
+		t.Fatalf("klaim setelah berkas diam = %d, want 1", claims)
+	}
+
+	// Yang diklaim harus versi lengkap, bukan versi setengah jadi.
+	data, err := os.ReadFile(last.SpoolPath)
+	if err != nil {
+		t.Fatalf("baca spool: %v", err)
+	}
+	if string(data) != head+"L|1|N\n" {
+		t.Errorf("isi spool = %q, want %q", data, head+"L|1|N\n")
 	}
 }

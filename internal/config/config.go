@@ -71,7 +71,16 @@ type Inbox struct {
 	// Claim menentukan cara mengambil berkas: "rename" (disarankan) atau
 	// "copy_verify_delete" bila rename ditolak ACL.
 	Claim string `yaml:"claim"`
+	// Stability adalah lama berkas harus diam (ukuran+mtime tidak berubah)
+	// sebelum diklaim. Default 0 = langsung klaim.
+	//
+	// Default 0 disengaja: Diana Server me-rename TX_TMP.dat menjadi OUT.dat
+	// secara atomik, jadi berkas yang terlihat sudah utuh dan menunggu hanya
+	// menambah jarak ke timeout mesin. Isi >0 hanya bila folder bersama diisi
+	// dengan cara lain, misalnya operator menyalin berkas manual.
+	Stability Duration `yaml:"stability"`
 	// DeleteDeadline hanya untuk alarm kesehatan, bukan penundaan hapus.
+	// Dipakai juga sebagai batas berkas kosong boleh dibiarkan di folder bersama.
 	DeleteDeadline Duration `yaml:"delete_deadline"`
 }
 
@@ -124,6 +133,14 @@ func Load(path string) (*Config, error) {
 // Dipakai mode -parse yang tidak menyentuh folder bersama maupun Prima.
 func LoadLenient(path string) (*Config, error) {
 	return load(path, false)
+}
+
+// Default mengembalikan konfigurasi dengan nilai bawaan tanpa membaca berkas.
+// Dipakai mode -parse agar bisa dicoba sebelum configs/agent.yaml dibuat.
+func Default() *Config {
+	c := &Config{}
+	c.applyDefaults()
+	return c
 }
 
 func load(path string, validate bool) (*Config, error) {
@@ -220,6 +237,9 @@ func (c *Config) Validate() error {
 	case "rename", "copy_verify_delete":
 	default:
 		return fmt.Errorf("inbox.claim harus \"rename\" atau \"copy_verify_delete\", bukan %q", c.Inbox.Claim)
+	}
+	if c.Inbox.Stability < 0 {
+		return fmt.Errorf("inbox.stability tidak boleh negatif")
 	}
 	if strings.TrimSpace(c.Prima.URL) == "" {
 		return fmt.Errorf("prima.url wajib diisi")

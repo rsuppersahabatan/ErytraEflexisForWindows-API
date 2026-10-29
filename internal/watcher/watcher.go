@@ -1,11 +1,14 @@
 // Package watcher memantau folder bersama Diana Server dan mengklaim OUT.dat.
 //
-// Dua keputusan penting di sini:
+// Tiga keputusan penting di sini:
 //  1. Yang dicari adalah nama persis "OUT.dat", bukan pola *.dat — Diana Server
 //     juga menulis TX_TMP.dat (berisi setengah transaksi) di folder yang sama.
 //  2. Berkas diklaim dengan rename atomik. Nama OUT.dat dipakai ulang, jadi
 //     menghapus tanpa klaim bisa menghapus transaksi baru yang datang di
 //     tengah proses.
+//  3. Berkas kosong tidak pernah diklaim langsung. Rename atas berkas yang
+//     masih ditulis akan memindahkan transaksi yang sedang berjalan, dan
+//     isinya tidak akan pernah sampai ke LIS.
 package watcher
 
 import (
@@ -46,24 +49,51 @@ type Watcher struct {
 	filename  string
 	claimMode string
 	poll      time.Duration
+	stability time.Duration
+	deadline  time.Duration
 	spoolDir  string
 	errorDir  string
 	log       *slog.Logger
+
+	// obs menyimpan pengamatan terakhir per nama berkas untuk gate kestabilan.
+	// Kuncinya nama huruf kecil, karena share Windows tidak membedakan besar
+	// kecil huruf pada nama berkas.
+	obs map[string]observation
+}
+
+// observation adalah keadaan berkas pada pemindaian sebelumnya.
+type observation struct {
+	size    int64
+	modTime time.Time
+	// stableAt adalah kapan kombinasi (size, modTime) ini pertama terlihat.
+	stableAt time.Time
+	// emptyAt adalah kapan berkas kosong pertama terlihat.
+	emptyAt time.Time
 }
 
 // New membuat watcher.
-func New(dir, filename, claimMode string, poll time.Duration, spoolDir, errorDir string, log *slog.Logger) *Watcher {
+//
+// stability = lama berkas harus diam (ukuran+mtime) sebelum diklaim; 0 berarti
+// langsung klaim. deadline = batas waktu berkas kosong boleh dibiarkan di
+// folder bersama sebelum dipindahkan ke folder error.
+func New(dir, filename, claimMode string, poll, stability, deadline time.Duration, spoolDir, errorDir string, log *slog.Logger) *Watcher {
 	if poll <= 0 {
 		poll = 2 * time.Second
+	}
+	if deadline <= 0 {
+		deadline = 30 * time.Second
 	}
 	return &Watcher{
 		dir:       dir,
 		filename:  filename,
 		claimMode: claimMode,
 		poll:      poll,
+		stability: stability,
+		deadline:  deadline,
 		spoolDir:  spoolDir,
 		errorDir:  errorDir,
 		log:       log,
+		obs:       make(map[string]observation),
 	}
 }
 
@@ -98,6 +128,11 @@ func (w *Watcher) tick(handle func(Claimed) error) {
 		return
 	}
 
+	// Sisa klaim sudah berada di folder kita sendiri, jadi tidak perlu gate.
+	if !leftover && !w.ready(name) {
+		return
+	}
+
 	var claimed Claimed
 	var err error
 	if leftover {
@@ -124,6 +159,61 @@ func (w *Watcher) tick(handle func(Claimed) error) {
 	if err := handle(claimed); err != nil {
 		w.log.Error("pemrosesan gagal", "file", claimed.SpoolPath, "err", err)
 	}
+}
+
+// ready menentukan apakah berkas layak diklaim sekarang.
+//
+// Dua penjaga, dan alasannya berbeda:
+//
+//   - Berkas kosong tidak pernah diklaim sebelum lewat deadline. Kalau Diana
+//     masih menulis, rename akan memindahkan transaksi yang sedang berjalan dan
+//     isinya hilang. Tetapi berkas kosong juga tidak boleh dibiarkan selamanya:
+//     folder bersama harus bersih sebelum timeout Diana, kalau tidak mesin yang
+//     memunculkan error. Jadi setelah deadline ia tetap diklaim, lalu pipeline
+//     memindahkannya ke folder error dengan alasan yang tercatat.
+//   - Gate kestabilan (bila stability > 0) menuntut ukuran+mtime tidak berubah
+//     selama durasi itu. Ini hanya perlu kalau OUT.dat diisi di tempat; pada
+//     alur normal Diana me-rename TX_TMP.dat secara atomik, sehingga berkas
+//     yang terlihat sudah utuh dan menunggu hanya menambah jarak ke timeout.
+func (w *Watcher) ready(name string) bool {
+	info, err := os.Stat(filepath.Join(w.dir, name))
+	if err != nil {
+		return false
+	}
+
+	key := strings.ToLower(name)
+	now := time.Now()
+	prev, seen := w.obs[key]
+
+	if info.Size() == 0 {
+		if !seen || prev.emptyAt.IsZero() {
+			w.obs[key] = observation{emptyAt: now}
+			return false
+		}
+		if now.Sub(prev.emptyAt) < w.deadline {
+			return false
+		}
+		w.log.Warn("berkas kosong melewati deadline, dipindahkan ke folder error",
+			"file", name, "ditunggu", now.Sub(prev.emptyAt).Round(time.Millisecond).String())
+		delete(w.obs, key)
+		return true
+	}
+
+	if w.stability <= 0 {
+		delete(w.obs, key)
+		return true
+	}
+
+	if !seen || prev.size != info.Size() || !prev.modTime.Equal(info.ModTime()) {
+		w.obs[key] = observation{size: info.Size(), modTime: info.ModTime(), stableAt: now}
+		return false
+	}
+	if now.Sub(prev.stableAt) < w.stability {
+		return false
+	}
+
+	delete(w.obs, key)
+	return true
 }
 
 // candidate mencari berkas yang harus diproses: sisa klaim lebih dulu,
