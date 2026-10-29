@@ -108,13 +108,13 @@ Bentuk JSON-nya didefinisikan di [`internal/model/model.go`](internal/model/mode
 
 Kunci idempotency dihitung dari `patient_id|test_code|requested_at` (RFC3339, UTC) dan dikirim sebagai header `Idempotency-Key`. Kunci yang sama disimpan `UNIQUE` di outbox, jadi duplikat tertahan di kedua sisi — termasuk saat mesin mengekspor ulang rentang tanggal yang sama.
 
-`components` dipetakan **berdasarkan nama template `.pln`**, bukan urutan kolom; `value_raw` disimpan apa adanya supaya hasil bisa diaudit terhadap file aslinya. `modified: true` diisi begitu ada nilai `M4+`, dan `Dis` pada komponen mana pun wajib memunculkan peringatan — mesin sendiri tetap mengirim `abnormal_flag: N` untuk keduanya.
+`components` dipetakan **berdasarkan nama template `.pln`**, bukan urutan kolom; `value_raw` disimpan apa adanya supaya hasil bisa diaudit terhadap file aslinya. `modified: true` diisi begitu ada nilai `M4+`, dan `discrepancy: true` diisi bila ada komponen bernilai `Dis` — plus satu baris `WARN` di log. Keduanya perlu field sendiri karena mesin tetap mengirim `abnormal_flag: "N"`; tanpa itu hasil yang tidak konsisten lolos ke hilir seolah normal.
 
 ---
 
 ## Sembilan aturan yang tidak boleh dilanggar
 
-1. **Kelengkapan dibuktikan mesin, bukan ditebak** — rename atomik, lalu `L|1|N`, lalu ukuran+mtime diam 2–3 detik.
+1. **Kelengkapan dibuktikan mesin, bukan ditebak** — rename atomik, lalu `L|1|N`, lalu **berkas kosong tidak pernah diklaim** sebelum `delete_deadline` lewat (setelah itu dipindah ke `error/` supaya folder bersama tetap bersih). Gate kestabilan ukuran+mtime tersedia lewat `inbox.stability`, default `0` karena alur Diana sudah atomik.
 2. **Klaim file dengan rename, jangan copy-lalu-hapus.** Karena nama `OUT.dat` dipakai ulang, hapus tanpa klaim bisa menghapus transaksi baru yang datang di tengah proses.
 3. **Hapus dari folder bersama secepat mungkin**, di jalur yang tidak menyentuh jaringan Prima.
 4. **Idempotency per hasil, bukan per file.** Kirim sebagai `Idempotency-Key`; simpan `UNIQUE` di SQLite.
@@ -132,7 +132,7 @@ Kunci idempotency dihitung dari `patient_id|test_code|requested_at` (RFC3339, UT
 
 | Lapisan | Pilihan | Catatan |
 |---|---|---|
-| Watcher | polling `os.Stat` (interval dari config) | `fsnotify` **tidak** dipakai: event tidak reliable di share jaringan, dan polling 500 ms sudah cukup untuk deadline 30 detik |
+| Watcher | polling `os.Stat` (interval dari config) + penjaga berkas kosong | `fsnotify` **tidak** dipakai: event tidak reliable di share jaringan, dan polling 500 ms sudah cukup untuk deadline 30 detik |
 | Parser | ASTM E1394 tulis sendiri + registry template `.pln` | tanpa dependency |
 | Klaim file | `os.Rename` (atomik), fallback copy–verifikasi–hapus | fallback dipakai bila rename lintas volume gagal |
 | Encoding | `golang.org/x/text/encoding` | UTF-8 dan Windows-1252 |
@@ -179,10 +179,10 @@ Contoh konfigurasi lengkap ada di [`configs/agent.example.yaml`](configs/agent.e
 ```bash
 go build -o bin/erytra-agent.exe ./cmd/agent
 
-# coba parser tanpa menyentuh folder bersama
+# coba parser tanpa konfigurasi dan tanpa menyentuh folder bersama
 ./bin/erytra-agent.exe -parse testdata/OUT_sample.dat
 
-# jalankan sebagai proses biasa (untuk uji)
+# jalankan sebagai proses biasa (untuk uji); salin dulu example → agent.yaml
 ./bin/erytra-agent.exe -config configs/agent.yaml
 
 # pasang sebagai Windows Service (butuh shell Administrator)
@@ -224,6 +224,8 @@ Default `127.0.0.1:8099` (atur di `api.addr`). Bind ke localhost saja — tidak 
 go test ./...          # 7 paket, termasuk uji retry dan idempotency
 go vet ./...
 ```
+
+Dua kasus di `internal/watcher` sengaja dibuat tes sendiri karena mahal kalau salah: **berkas 0 byte** tidak boleh diklaim sebelum `delete_deadline` (kalau diklaim, transaksi yang sedang ditulis hilang), dan **gate kestabilan** harus menahan berkas yang ukurannya masih bertambah.
 
 Uji end-to-end tanpa Prima asli:
 
